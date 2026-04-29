@@ -1,0 +1,318 @@
+using System.Windows;
+using System.Windows.Threading;
+using QueueCutoff.App.Infrastructure;
+using QueueCutoff.App.Windows;
+using QueueCutoff.Core.Abstractions;
+using QueueCutoff.Core.Models;
+using QueueCutoff.Core.Services;
+using WpfApplication = System.Windows.Application;
+using WpfMessageBox = System.Windows.MessageBox;
+
+namespace QueueCutoff.App;
+
+public sealed class AppController : IAsyncDisposable
+{
+    private readonly Dispatcher _dispatcher;
+    private readonly IStateStore _stateStore;
+    private readonly DailyLockService _lockService;
+    private readonly IClock _clock;
+    private readonly EnforcementEngine _engine;
+    private readonly IProcessMonitor _processMonitor;
+    private readonly ILcuClient _lcuClient;
+    private readonly IBlockBackend _blockBackend;
+    private readonly IAutostartService _autostart;
+    private readonly PeriodicTimer _timer = new(TimeSpan.FromSeconds(5));
+    private readonly CancellationTokenSource _cts = new();
+    private readonly SemaphoreSlim _tickLock = new(1, 1);
+
+    private Task? _loopTask;
+    private LeagueProcessSnapshot _snapshot = new(false, false, []);
+    private GameflowPhase _phase = GameflowPhase.Unknown;
+    private bool _isBlocking;
+    private bool _settingsOpen;
+    private bool _confirmationOpen;
+    private bool _confirmationDismissedForCurrentClientRun;
+    private bool _lastClientRunning;
+    private AppSettings _settings = new();
+
+    public AppController(
+        Dispatcher dispatcher,
+        IStateStore stateStore,
+        DailyLockService lockService,
+        IClock clock,
+        EnforcementEngine engine,
+        IProcessMonitor processMonitor,
+        ILcuClient lcuClient,
+        IBlockBackend blockBackend,
+        IAutostartService autostart)
+    {
+        _dispatcher = dispatcher;
+        _stateStore = stateStore;
+        _lockService = lockService;
+        _clock = clock;
+        _engine = engine;
+        _processMonitor = processMonitor;
+        _lcuClient = lcuClient;
+        _blockBackend = blockBackend;
+        _autostart = autostart;
+        _processMonitor.LeagueProcessesChanged += snapshot => _ = HandleSnapshotAsync(snapshot);
+    }
+
+    public event EventHandler? StatusChanged;
+
+    public string StatusText
+    {
+        get
+        {
+            var blockText = _isBlocking ? "blocking queue traffic" : "not blocking";
+            var leagueText = _snapshot.IsClientRunning ? "League client running" : "League client not running";
+            return $"{leagueText}; phase {_phase}; {blockText}.";
+        }
+    }
+
+    public bool CanExit =>
+        !(_settings.PreventExitWhileLeagueRunning && _snapshot.IsClientRunning) &&
+        !(_settings.PreventExitWhileEnforcing && _isBlocking);
+
+    public async Task StartAsync()
+    {
+        _settings = await _stateStore.LoadSettingsAsync(_cts.Token);
+        _snapshot = await _processMonitor.GetSnapshotAsync(_cts.Token);
+        _lastClientRunning = _snapshot.IsClientRunning;
+        _isBlocking = await _blockBackend.GetStatusAsync(_cts.Token);
+        await _processMonitor.StartAsync(_cts.Token);
+        _loopTask = Task.Run(RunLoopAsync);
+        await TickAsync(_cts.Token);
+    }
+
+    public async Task OpenSettingsAsync()
+    {
+        if (_settingsOpen)
+        {
+            return;
+        }
+
+        _settingsOpen = true;
+        try
+        {
+            var settings = await _stateStore.LoadSettingsAsync(_cts.Token);
+            var todayLock = await _lockService.GetTodayLockAsync(_cts.Token);
+
+            var settingsResult = await _dispatcher.InvokeAsync<SettingsWindowResult?>(() =>
+            {
+                var window = new SettingsWindow(settings, todayLock);
+                return window.ShowDialog() == true
+                    ? new SettingsWindowResult(window.Settings, window.TodayCutoff)
+                    : null;
+            });
+
+            if (settingsResult is not null)
+            {
+                await SaveSettingsAsync(settingsResult.Settings);
+                if (settingsResult.TodayCutoff.HasValue)
+                {
+                    await _lockService.ConfirmTodayAsync(settingsResult.TodayCutoff.Value, _cts.Token);
+                }
+            }
+        }
+        finally
+        {
+            _settingsOpen = false;
+        }
+    }
+
+    public void ShowStatus()
+    {
+        WpfMessageBox.Show(StatusText, "QueueCutoff", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    public void RequestExit()
+    {
+        if (!CanExit)
+        {
+            WpfMessageBox.Show(
+                "QueueCutoff is locked while League is running or enforcement is active.",
+                "QueueCutoff",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        WpfApplication.Current.Shutdown();
+    }
+
+    private async Task SaveSettingsAsync(AppSettings settings)
+    {
+        _settings = settings;
+        await _stateStore.SaveSettingsAsync(settings, _cts.Token);
+        await _autostart.SetEnabledAsync(settings.AutostartEnabled, _cts.Token);
+        StatusChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private async Task RunLoopAsync()
+    {
+        try
+        {
+            while (await _timer.WaitForNextTickAsync(_cts.Token))
+            {
+                await TickAsync(_cts.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task HandleSnapshotAsync(LeagueProcessSnapshot snapshot)
+    {
+        UpdateSnapshot(snapshot);
+        StatusChanged?.Invoke(this, EventArgs.Empty);
+
+        if (snapshot.IsClientRunning)
+        {
+            await MaybeShowConfirmationAsync();
+        }
+
+        await TickAsync(_cts.Token);
+    }
+
+    private async Task TickAsync(CancellationToken cancellationToken)
+    {
+        if (!await _tickLock.WaitAsync(0, cancellationToken))
+        {
+            return;
+        }
+
+        try
+        {
+            _settings = await _stateStore.LoadSettingsAsync(cancellationToken);
+            UpdateSnapshot(await _processMonitor.GetSnapshotAsync(cancellationToken));
+
+            if (_snapshot.IsClientRunning)
+            {
+                await MaybeShowConfirmationAsync();
+                _phase = await _lcuClient.GetGameflowPhaseAsync(_settings.LeagueInstallPath, cancellationToken);
+            }
+            else
+            {
+                _phase = GameflowPhase.Unknown;
+            }
+
+            var todayLock = await _lockService.GetTodayLockAsync(cancellationToken);
+            var decision = _engine.Decide(_clock.Now, todayLock, _phase, _snapshot.IsGameRunning);
+
+            if (decision.ShouldBlock)
+            {
+                var paths = LeagueProcessPathFilter.GetBlockablePaths(_snapshot.ExecutablePaths);
+                if (_isBlocking && !_snapshot.IsClientRunning)
+                {
+                    await _blockBackend.DisableAsync(cancellationToken);
+                    _isBlocking = false;
+                }
+                else if (!_isBlocking && paths.Count > 0)
+                {
+                    await _blockBackend.EnableAsync(paths, cancellationToken);
+                    await _lockService.MarkEnforcementActivatedAsync(cancellationToken);
+                    _dispatcher.Invoke(() => System.Windows.Forms.MessageBox.Show(
+                        "Cutoff reached. Good night.",
+                        "QueueCutoff",
+                        System.Windows.Forms.MessageBoxButtons.OK,
+                        System.Windows.Forms.MessageBoxIcon.Information));
+                    _isBlocking = true;
+                }
+                else if (!_isBlocking && paths.Count == 0)
+                {
+                    // No process path is available yet. Wait for the next process snapshot before creating rules.
+                }
+            }
+            else if (_isBlocking)
+            {
+                await _blockBackend.DisableAsync(cancellationToken);
+                _isBlocking = false;
+            }
+
+            StatusChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch
+        {
+            _phase = GameflowPhase.Unknown;
+            StatusChanged?.Invoke(this, EventArgs.Empty);
+        }
+        finally
+        {
+            _tickLock.Release();
+        }
+    }
+
+    private async Task MaybeShowConfirmationAsync()
+    {
+        if (_confirmationOpen ||
+            _settingsOpen ||
+            _confirmationDismissedForCurrentClientRun ||
+            await _lockService.GetTodayLockAsync(_cts.Token) is not null)
+        {
+            return;
+        }
+
+        _confirmationOpen = true;
+        try
+        {
+            var settings = await _stateStore.LoadSettingsAsync(_cts.Token);
+            var cutoff = await _dispatcher.InvokeAsync<TimeOnly?>(() =>
+            {
+                var window = new ConfirmCutoffWindow(settings.DefaultCutoff, settings.DayResetTime);
+                return window.ShowDialog() == true ? window.Cutoff : null;
+            });
+
+            if (cutoff.HasValue)
+            {
+                await _lockService.ConfirmTodayAsync(cutoff.Value, _cts.Token);
+            }
+            else
+            {
+                _confirmationDismissedForCurrentClientRun = true;
+            }
+        }
+        finally
+        {
+            _confirmationOpen = false;
+        }
+    }
+
+    private void UpdateSnapshot(LeagueProcessSnapshot snapshot)
+    {
+        if (!_lastClientRunning && snapshot.IsClientRunning)
+        {
+            _confirmationDismissedForCurrentClientRun = false;
+        }
+
+        if (!snapshot.IsClientRunning)
+        {
+            _confirmationDismissedForCurrentClientRun = false;
+        }
+
+        _lastClientRunning = snapshot.IsClientRunning;
+        _snapshot = snapshot;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+
+        if (_loopTask is not null)
+        {
+            try
+            {
+                await _loopTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        _timer.Dispose();
+        await _processMonitor.DisposeAsync();
+        _cts.Dispose();
+        _tickLock.Dispose();
+    }
+}
