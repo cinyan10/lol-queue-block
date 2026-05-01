@@ -12,7 +12,9 @@ public sealed class WindowsProcessMonitor : IProcessMonitor
         "LeagueClientUx",
         "LeagueClientUxRender",
         "League of Legends",
-        "RiotClientServices"
+        "RiotClientServices",
+        "RiotClientUx",
+        "RiotClientUxRender"
     ];
 
     private ManagementEventWatcher? _startWatcher;

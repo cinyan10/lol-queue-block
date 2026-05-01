@@ -29,9 +29,9 @@ public sealed class AppController : IAsyncDisposable
     private LeagueProcessSnapshot _snapshot = new(false, false, []);
     private GameflowPhase _phase = GameflowPhase.Unknown;
     private bool _isBlocking;
+    private string? _activeBlockSignature;
     private bool _settingsOpen;
     private bool _confirmationOpen;
-    private bool _confirmationDismissedForCurrentClientRun;
     private bool _lastClientRunning;
     private AppSettings _settings = new();
 
@@ -187,6 +187,14 @@ public sealed class AppController : IAsyncDisposable
         {
             _settings = await _stateStore.LoadSettingsAsync(cancellationToken);
             UpdateSnapshot(await _processMonitor.GetSnapshotAsync(cancellationToken));
+            var todayLock = await _lockService.GetTodayLockAsync(cancellationToken);
+
+            if (todayLock is null && _isBlocking)
+            {
+                await _blockBackend.DisableAsync(cancellationToken);
+                _isBlocking = false;
+                _activeBlockSignature = null;
+            }
 
             if (_snapshot.IsClientRunning)
             {
@@ -198,37 +206,47 @@ public sealed class AppController : IAsyncDisposable
                 _phase = GameflowPhase.Unknown;
             }
 
-            var todayLock = await _lockService.GetTodayLockAsync(cancellationToken);
+            todayLock = await _lockService.GetTodayLockAsync(cancellationToken);
             var decision = _engine.Decide(_clock.Now, todayLock, _phase, _snapshot.IsGameRunning);
 
             if (decision.ShouldBlock)
             {
-                var paths = LeagueProcessPathFilter.GetBlockablePaths(_snapshot.ExecutablePaths);
-                if (_isBlocking && !_snapshot.IsClientRunning)
+                if (!_snapshot.IsClientRunning)
                 {
-                    await _blockBackend.DisableAsync(cancellationToken);
-                    _isBlocking = false;
+                    if (_isBlocking)
+                    {
+                        await _blockBackend.DisableAsync(cancellationToken);
+                        _isBlocking = false;
+                        _activeBlockSignature = null;
+                    }
                 }
-                else if (!_isBlocking && paths.Count > 0)
+                else
                 {
-                    await _blockBackend.EnableAsync(paths, cancellationToken);
-                    await _lockService.MarkEnforcementActivatedAsync(cancellationToken);
-                    _dispatcher.Invoke(() => System.Windows.Forms.MessageBox.Show(
-                        "Cutoff reached. Good night.",
-                        "QueueCutoff",
-                        System.Windows.Forms.MessageBoxButtons.OK,
-                        System.Windows.Forms.MessageBoxIcon.Information));
-                    _isBlocking = true;
-                }
-                else if (!_isBlocking && paths.Count == 0)
-                {
-                    // No process path is available yet. Wait for the next process snapshot before creating rules.
+                    var paths = LeagueProcessPathFilter.GetBlockablePaths(_snapshot.ExecutablePaths);
+                    var blockSignature = CreateBlockSignature(paths);
+                    if (paths.Count > 0 && (!_isBlocking || _activeBlockSignature != blockSignature))
+                    {
+                        await _blockBackend.EnableAsync(paths, cancellationToken);
+                        await _lockService.MarkEnforcementActivatedAsync(cancellationToken);
+                        if (!_isBlocking)
+                        {
+                            _dispatcher.Invoke(() => System.Windows.Forms.MessageBox.Show(
+                                "Cutoff reached. Good night.",
+                                "QueueCutoff",
+                                System.Windows.Forms.MessageBoxButtons.OK,
+                                System.Windows.Forms.MessageBoxIcon.Information));
+                        }
+
+                        _isBlocking = true;
+                        _activeBlockSignature = blockSignature;
+                    }
                 }
             }
             else if (_isBlocking)
             {
                 await _blockBackend.DisableAsync(cancellationToken);
                 _isBlocking = false;
+                _activeBlockSignature = null;
             }
 
             StatusChanged?.Invoke(this, EventArgs.Empty);
@@ -248,7 +266,6 @@ public sealed class AppController : IAsyncDisposable
     {
         if (_confirmationOpen ||
             _settingsOpen ||
-            _confirmationDismissedForCurrentClientRun ||
             await _lockService.GetTodayLockAsync(_cts.Token) is not null)
         {
             return;
@@ -258,20 +275,13 @@ public sealed class AppController : IAsyncDisposable
         try
         {
             var settings = await _stateStore.LoadSettingsAsync(_cts.Token);
-            var cutoff = await _dispatcher.InvokeAsync<TimeOnly?>(() =>
+            var cutoff = await _dispatcher.InvokeAsync(() =>
             {
                 var window = new ConfirmCutoffWindow(settings.DefaultCutoff, settings.DayResetTime);
-                return window.ShowDialog() == true ? window.Cutoff : null;
+                return window.ShowDialog() == true ? window.Cutoff : settings.DefaultCutoff;
             });
 
-            if (cutoff.HasValue)
-            {
-                await _lockService.ConfirmTodayAsync(cutoff.Value, _cts.Token);
-            }
-            else
-            {
-                _confirmationDismissedForCurrentClientRun = true;
-            }
+            await _lockService.ConfirmTodayAsync(cutoff, _cts.Token);
         }
         finally
         {
@@ -283,16 +293,16 @@ public sealed class AppController : IAsyncDisposable
     {
         if (!_lastClientRunning && snapshot.IsClientRunning)
         {
-            _confirmationDismissedForCurrentClientRun = false;
-        }
-
-        if (!snapshot.IsClientRunning)
-        {
-            _confirmationDismissedForCurrentClientRun = false;
+            _ = Task.Run(() => MaybeShowConfirmationAsync());
         }
 
         _lastClientRunning = snapshot.IsClientRunning;
         _snapshot = snapshot;
+    }
+
+    private static string CreateBlockSignature(IReadOnlyCollection<string> paths)
+    {
+        return string.Join("|", paths.OrderBy(path => path, StringComparer.OrdinalIgnoreCase));
     }
 
     public async ValueTask DisposeAsync()

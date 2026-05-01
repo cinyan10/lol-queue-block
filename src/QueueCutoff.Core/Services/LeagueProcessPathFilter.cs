@@ -7,7 +7,9 @@ public static class LeagueProcessPathFilter
         "LeagueClient.exe",
         "LeagueClientUx.exe",
         "LeagueClientUxRender.exe",
-        "RiotClientServices.exe"
+        "RiotClientServices.exe",
+        "RiotClientUx.exe",
+        "RiotClientUxRender.exe"
     };
 
     public static IReadOnlyCollection<string> GetBlockablePaths(IEnumerable<string> executablePaths)
