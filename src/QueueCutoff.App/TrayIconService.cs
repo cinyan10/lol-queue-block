@@ -27,6 +27,7 @@ public sealed class TrayIconService : IDisposable
         menu.Items.Add(_exitItem);
 
         _statusItem.Enabled = false;
+        _exitItem.ForeColor = SystemColors.GrayText;
         _exitItem.Click += (_, _) => _controller.RequestExit();
 
         _notifyIcon = new NotifyIcon
@@ -45,7 +46,7 @@ public sealed class TrayIconService : IDisposable
     private void Refresh()
     {
         _statusItem.Text = _controller.StatusText;
-        _exitItem.Enabled = _controller.CanExit;
+        _exitItem.Enabled = true;
         _notifyIcon.Text = _controller.StatusText.Length > 63
             ? _controller.StatusText[..63]
             : _controller.StatusText;
