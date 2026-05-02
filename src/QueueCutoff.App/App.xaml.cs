@@ -43,7 +43,8 @@ public partial class App : System.Windows.Application
             processMonitor,
             lcuClient,
             firewall,
-            autostart);
+            autostart,
+            new PlayBreakTracker());
 
         _tray = new TrayIconService(_controller);
         await _controller.StartAsync();

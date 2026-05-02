@@ -1,11 +1,13 @@
 using System.Drawing;
 using System.Windows.Forms;
+using System.Windows.Threading;
 
 namespace QueueCutoff.App;
 
 public sealed class TrayIconService : IDisposable
 {
     private readonly AppController _controller;
+    private readonly Dispatcher _dispatcher;
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _statusItem;
     private readonly ToolStripMenuItem _exitItem;
@@ -13,6 +15,7 @@ public sealed class TrayIconService : IDisposable
     public TrayIconService(AppController controller)
     {
         _controller = controller;
+        _dispatcher = System.Windows.Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
         _statusItem = new ToolStripMenuItem("Starting...");
         _exitItem = new ToolStripMenuItem("Exit");
 
@@ -35,8 +38,7 @@ public sealed class TrayIconService : IDisposable
         };
 
         _notifyIcon.DoubleClick += async (_, _) => await _controller.OpenSettingsAsync();
-        _controller.StatusChanged += (_, _) =>
-            System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(Refresh));
+        _controller.StatusChanged += (_, _) => _dispatcher.BeginInvoke(new Action(Refresh));
         Refresh();
     }
 

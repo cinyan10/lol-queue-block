@@ -21,6 +21,7 @@ public sealed class AppController : IAsyncDisposable
     private readonly ILcuClient _lcuClient;
     private readonly IBlockBackend _blockBackend;
     private readonly IAutostartService _autostart;
+    private readonly PlayBreakTracker _playBreakTracker;
     private readonly PeriodicTimer _timer = new(TimeSpan.FromSeconds(5));
     private readonly CancellationTokenSource _cts = new();
     private readonly SemaphoreSlim _tickLock = new(1, 1);
@@ -28,6 +29,7 @@ public sealed class AppController : IAsyncDisposable
     private Task? _loopTask;
     private LeagueProcessSnapshot _snapshot = new(false, false, []);
     private GameflowPhase _phase = GameflowPhase.Unknown;
+    private PlayBreakDecision _playBreakDecision = new(false, false, false, false, TimeSpan.Zero, TimeSpan.Zero);
     private bool _isBlocking;
     private string? _activeBlockSignature;
     private bool _settingsOpen;
@@ -44,7 +46,8 @@ public sealed class AppController : IAsyncDisposable
         IProcessMonitor processMonitor,
         ILcuClient lcuClient,
         IBlockBackend blockBackend,
-        IAutostartService autostart)
+        IAutostartService autostart,
+        PlayBreakTracker playBreakTracker)
     {
         _dispatcher = dispatcher;
         _stateStore = stateStore;
@@ -55,6 +58,7 @@ public sealed class AppController : IAsyncDisposable
         _lcuClient = lcuClient;
         _blockBackend = blockBackend;
         _autostart = autostart;
+        _playBreakTracker = playBreakTracker;
         _processMonitor.LeagueProcessesChanged += snapshot => _ = HandleSnapshotAsync(snapshot);
     }
 
@@ -66,7 +70,12 @@ public sealed class AppController : IAsyncDisposable
         {
             var blockText = _isBlocking ? "blocking queue traffic" : "not blocking";
             var leagueText = _snapshot.IsClientRunning ? "League client running" : "League client not running";
-            return $"{leagueText}; phase {_phase}; {blockText}.";
+            var breakText = _playBreakDecision.IsBreakActive
+                ? $" Play break active ({_playBreakDecision.RemainingBreak:mm\\:ss} remaining)."
+                : _playBreakDecision.IsBreakPending
+                    ? " Play break pending until the current game ends."
+                    : string.Empty;
+            return $"{leagueText}; phase {_phase}; {blockText}.{breakText}";
         }
     }
 
@@ -138,7 +147,25 @@ public sealed class AppController : IAsyncDisposable
             return;
         }
 
-        WpfApplication.Current.Shutdown();
+        var app = WpfApplication.Current;
+        if (app is not null)
+        {
+            if (app.Dispatcher.CheckAccess())
+            {
+                app.Shutdown();
+            }
+            else
+            {
+                app.Dispatcher.Invoke(app.Shutdown);
+            }
+
+            return;
+        }
+
+        if (!_dispatcher.HasShutdownStarted && !_dispatcher.HasShutdownFinished)
+        {
+            _dispatcher.BeginInvokeShutdown(DispatcherPriority.Normal);
+        }
     }
 
     private async Task SaveSettingsAsync(AppSettings settings)
@@ -207,9 +234,12 @@ public sealed class AppController : IAsyncDisposable
             }
 
             todayLock = await _lockService.GetTodayLockAsync(cancellationToken);
-            var decision = _engine.Decide(_clock.Now, todayLock, _phase, _snapshot.IsGameRunning);
+            var now = _clock.Now;
+            var decision = _engine.Decide(now, todayLock, _phase, _snapshot.IsGameRunning);
+            _playBreakDecision = _playBreakTracker.Decide(now, _snapshot.IsGameRunning);
+            var shouldBlock = decision.ShouldBlock || _playBreakDecision.ShouldBlock;
 
-            if (decision.ShouldBlock)
+            if (shouldBlock)
             {
                 if (!_snapshot.IsClientRunning)
                 {
@@ -224,14 +254,20 @@ public sealed class AppController : IAsyncDisposable
                 {
                     var paths = LeagueProcessPathFilter.GetBlockablePaths(_snapshot.ExecutablePaths);
                     var blockSignature = CreateBlockSignature(paths);
+                    if (paths.Count > 0 && decision.ShouldBlock)
+                    {
+                        await _lockService.MarkEnforcementActivatedAsync(cancellationToken);
+                    }
+
                     if (paths.Count > 0 && (!_isBlocking || _activeBlockSignature != blockSignature))
                     {
                         await _blockBackend.EnableAsync(paths, cancellationToken);
-                        await _lockService.MarkEnforcementActivatedAsync(cancellationToken);
                         if (!_isBlocking)
                         {
                             _dispatcher.Invoke(() => System.Windows.Forms.MessageBox.Show(
-                                "Cutoff reached. Good night.",
+                                decision.ShouldBlock
+                                    ? "Cutoff reached. Good night."
+                                    : "One hour played. Take a 3 minute break.",
                                 "QueueCutoff",
                                 System.Windows.Forms.MessageBoxButtons.OK,
                                 System.Windows.Forms.MessageBoxIcon.Information));
@@ -239,6 +275,15 @@ public sealed class AppController : IAsyncDisposable
 
                         _isBlocking = true;
                         _activeBlockSignature = blockSignature;
+                    }
+
+                    if (_playBreakDecision.BreakStarted && _isBlocking && decision.ShouldBlock)
+                    {
+                        _dispatcher.Invoke(() => System.Windows.Forms.MessageBox.Show(
+                            "One hour played. Take a 3 minute break.",
+                            "QueueCutoff",
+                            System.Windows.Forms.MessageBoxButtons.OK,
+                            System.Windows.Forms.MessageBoxIcon.Information));
                     }
                 }
             }
