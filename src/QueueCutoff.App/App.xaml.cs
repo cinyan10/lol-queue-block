@@ -32,7 +32,7 @@ public partial class App : System.Windows.Application
         var firewall = new ElevatedFirewallBlockBackend(helperPath);
         var processMonitor = new WindowsProcessMonitor();
         var lcuClient = new LcuClient();
-        var autostart = new ScheduledTaskAutostart();
+        var autostart = new RegistryAutostart();
 
         _controller = new AppController(
             Dispatcher,

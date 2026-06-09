@@ -86,6 +86,15 @@ public sealed class AppController : IAsyncDisposable
     public async Task StartAsync()
     {
         _settings = await _stateStore.LoadSettingsAsync(_cts.Token);
+        try
+        {
+            await _autostart.SetEnabledAsync(_settings.AutostartEnabled, _cts.Token);
+        }
+        catch
+        {
+            // Autostart sync should not prevent the tray app from running.
+        }
+
         _snapshot = await _processMonitor.GetSnapshotAsync(_cts.Token);
         _lastClientRunning = _snapshot.IsClientRunning;
         _isBlocking = await _blockBackend.GetStatusAsync(_cts.Token);
