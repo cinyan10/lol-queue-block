@@ -20,20 +20,70 @@ public sealed class PlayBreakTrackerTests
     }
 
     [Fact]
-    public void Decide_AccumulatesOnlyWhileGameProcessRuns()
+    public void Decide_AccumulatesAcrossShortInactiveGap()
     {
         var tracker = new PlayBreakTracker(playLimit: TimeSpan.FromHours(1));
         var start = Local(2026, 4, 29, 20, 0);
 
         tracker.Decide(start, isGameProcessRunning: true);
         tracker.Decide(start.AddMinutes(30), isGameProcessRunning: true);
-        tracker.Decide(start.AddMinutes(50), isGameProcessRunning: false);
-        tracker.Decide(start.AddMinutes(80), isGameProcessRunning: true);
-        var decision = tracker.Decide(start.AddMinutes(90), isGameProcessRunning: true);
+        tracker.Decide(start.AddMinutes(32), isGameProcessRunning: false);
+        tracker.Decide(start.AddMinutes(34), isGameProcessRunning: true);
+        var decision = tracker.Decide(start.AddMinutes(64), isGameProcessRunning: true);
 
         Assert.False(decision.ShouldBlock);
         Assert.True(decision.IsBreakPending);
-        Assert.Equal(TimeSpan.FromHours(1), decision.AccumulatedPlayTime);
+        Assert.Equal(TimeSpan.FromMinutes(62), decision.AccumulatedPlayTime);
+    }
+
+    [Fact]
+    public void Decide_DoesNotResetPlayTimeBeforeInactivityLimit()
+    {
+        var tracker = new PlayBreakTracker(playLimit: TimeSpan.FromHours(1));
+        var start = Local(2026, 4, 29, 20, 0);
+
+        tracker.Decide(start, isGameProcessRunning: true);
+        tracker.Decide(start.AddMinutes(30), isGameProcessRunning: true);
+        tracker.Decide(start.AddMinutes(30), isGameProcessRunning: false);
+        var decision = tracker.Decide(start.AddMinutes(34).AddSeconds(59), isGameProcessRunning: false);
+
+        Assert.False(decision.ShouldBlock);
+        Assert.False(decision.IsBreakPending);
+        Assert.Equal(TimeSpan.FromMinutes(30), decision.AccumulatedPlayTime);
+    }
+
+    [Fact]
+    public void Decide_ResetsPlayTimeAfterFiveMinutesInactive()
+    {
+        var tracker = new PlayBreakTracker(playLimit: TimeSpan.FromHours(1));
+        var start = Local(2026, 4, 29, 20, 0);
+
+        tracker.Decide(start, isGameProcessRunning: true);
+        tracker.Decide(start.AddMinutes(30), isGameProcessRunning: true);
+        tracker.Decide(start.AddMinutes(30), isGameProcessRunning: false);
+        var decision = tracker.Decide(start.AddMinutes(35), isGameProcessRunning: false);
+
+        Assert.False(decision.ShouldBlock);
+        Assert.False(decision.IsBreakPending);
+        Assert.Equal(TimeSpan.Zero, decision.AccumulatedPlayTime);
+    }
+
+    [Fact]
+    public void Decide_AccumulatesFromZeroAfterInactiveReset()
+    {
+        var tracker = new PlayBreakTracker(playLimit: TimeSpan.FromHours(1));
+        var start = Local(2026, 4, 29, 20, 0);
+
+        tracker.Decide(start, isGameProcessRunning: true);
+        tracker.Decide(start.AddMinutes(30), isGameProcessRunning: true);
+        tracker.Decide(start.AddMinutes(30), isGameProcessRunning: false);
+        tracker.Decide(start.AddMinutes(35), isGameProcessRunning: false);
+        tracker.Decide(start.AddMinutes(36), isGameProcessRunning: true);
+        var decision = tracker.Decide(start.AddMinutes(46), isGameProcessRunning: true);
+
+        Assert.False(decision.ShouldBlock);
+        Assert.False(decision.IsBreakPending);
+        Assert.Equal(TimeSpan.FromMinutes(10), decision.AccumulatedPlayTime);
     }
 
     [Fact]
